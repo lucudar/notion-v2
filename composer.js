@@ -50,6 +50,7 @@
     spaceModels: null, // codenames the workspace offers (getAvailableModels), null = not read yet
     spaceInfo: {}, // codename -> limits from the workspace catalogue (efforts, default, flags)
     limitsOpen: false,
+    oldChatUrl: null, // last page whose AI chat sent runInferenceTranscript (classic chat)
   };
 
   function modelById(id) {
@@ -345,6 +346,9 @@
       .watch { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #c8c8c4; cursor: pointer; }
       .watchnote { padding: 0 10px 6px; font-size: 11px; color: #d6a74a; }
       .runs { max-height: 260px; }
+      .oldrow { flex: none; padding: 8px 10px 0; display: flex; flex-direction: column; gap: 4px; border-top: 1px solid rgba(255,255,255,0.08); }
+      .oldrow .oldbtn { width: 100%; padding: 6px 8px; text-align: center; }
+      .oldnote { font-size: 11px; line-height: 1.35; color: #d6a74a; }
       .hidden { display: none !important; }
     </style>
 
@@ -382,12 +386,16 @@
         <div class="logbar"><span>Limits (workspace catalogue)</span><span class="limsum"></span></div>
         <div class="limbody"></div>
       </div>
+      <div class="oldrow">
+        <button class="logbtn oldbtn" type="button">Open old AI chat</button>
+        <div class="oldnote hidden"></div>
+      </div>
       <div class="foot">
         <span class="sd"></span>
         <span class="txt">No AI requests seen yet — send a message</span>
         <button class="logbtn chatbtn" type="button" aria-expanded="false">Chat</button>
         <button class="logbtn limbtn" type="button" aria-expanded="false">Limits</button>
-        <button class="logbtn" type="button" aria-expanded="false">Log</button>
+        <button class="logbtn logtgl" type="button" aria-expanded="false">Log</button>
       </div>
     </div>
   `;
@@ -411,8 +419,11 @@
   const footTxt = shadow.querySelector('.txt');
   const logBox = shadow.querySelector('.log');
   const logBody = shadow.querySelector('.logbody');
-  const logBtn = shadow.querySelector('.logbtn:not(.chatbtn)');
+  // '.logbtn:not(.chatbtn)' used to match the Limits button first, so Log never toggled.
+  const logBtn = shadow.querySelector('.logtgl');
   const chatBtn = shadow.querySelector('.chatbtn');
+  const oldBtn = shadow.querySelector('.oldbtn');
+  const oldNote = shadow.querySelector('.oldnote');
   const runsBox = shadow.querySelector('.runs');
   const runsBody = shadow.querySelector('.runsbody');
   const limBox = shadow.querySelector('.limits');
@@ -574,6 +585,79 @@
     }
     renderRuns();
   });
+  // ------------------------------------------------------------ old AI chat
+  //
+  // The classic Notion AI chat sends /api/v3/runInferenceTranscript: that is
+  // where model and effort get swapped. The new chat (agent threads) carries
+  // neither. inject.js reports the page of every runInferenceTranscript call
+  // (NOTION_EFFORT_OLD_CHAT), so this button can return there. Until one has
+  // been seen it falls back to Notion's own AI shortcut (Ctrl/Cmd+J).
+  const NOTION_ORIGINS = ['https://app.notion.com', 'https://www.notion.so', 'https://notion.so'];
+  function isMac() {
+    return /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent || '');
+  }
+  function isNotionUrl(href) {
+    try {
+      const o = new URL(href).origin;
+      return o === location.origin || NOTION_ORIGINS.indexOf(o) !== -1;
+    } catch (e) {
+      return false;
+    }
+  }
+  function renderOldChat(note) {
+    oldBtn.title = state.oldChatUrl
+      ? 'Opens the last classic Notion AI chat: ' + state.oldChatUrl
+      : 'Opens the classic Notion AI chat (' + (isMac() ? '⌘J' : 'Ctrl+J') + '). Send one message there and the button remembers it.';
+    oldNote.textContent = note || '';
+    oldNote.classList.toggle('hidden', !note);
+  }
+  function countComposers() {
+    let n = 0;
+    document.querySelectorAll('[contenteditable="true"][role="textbox"], textarea').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width >= 180 && r.height >= 16 && r.bottom >= 0 && r.top <= window.innerHeight) n++;
+    });
+    return n;
+  }
+  function pressAiShortcut() {
+    const mac = isMac();
+    const init = { key: 'j', code: 'KeyJ', keyCode: 74, which: 74, ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true, composed: true };
+    const target = document.body || document.documentElement;
+    target.dispatchEvent(new KeyboardEvent('keydown', init));
+    target.dispatchEvent(new KeyboardEvent('keyup', init));
+  }
+  function openOldChat() {
+    renderOldChat();
+    const saved = state.oldChatUrl;
+    if (saved && saved !== location.href && isNotionUrl(saved)) {
+      setOpen(false);
+      location.assign(saved);
+      return;
+    }
+    if (saved && saved === location.href) {
+      // Already in it: just put the cursor in the composer.
+      setOpen(false);
+      const found = findComposer();
+      if (found) found.el.focus({ preventScroll: true });
+      return;
+    }
+    const before = location.href + '|' + countComposers();
+    setOpen(false);
+    pressAiShortcut();
+    setTimeout(() => {
+      if (location.href + '|' + countComposers() !== before) return;
+      setOpen(true);
+      renderOldChat(
+        'Notion did not open the AI chat. Press ' + (isMac() ? '⌘J' : 'Ctrl+J') +
+        ' or open Notion AI from the sidebar and send one message: the button will remember that chat.'
+      );
+    }, 900);
+  }
+  oldBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openOldChat();
+  });
+
   watchBox.addEventListener('click', (e) => e.stopPropagation());
   shadow.querySelector('.watch').addEventListener('click', (e) => e.stopPropagation());
   watchBox.addEventListener('change', () => {
@@ -1300,6 +1384,14 @@
       if (!currentVerdict()) renderFoot();
     }
 
+    if (e.data.type === 'NOTION_EFFORT_OLD_CHAT' && typeof e.data.href === 'string' && isNotionUrl(e.data.href)) {
+      if (state.oldChatUrl !== e.data.href) {
+        state.oldChatUrl = e.data.href;
+        chrome.storage.local.set({ oldChatUrl: e.data.href });
+        renderOldChat();
+      }
+    }
+
     if (e.data.type === 'NOTION_EFFORT_SPACE_MODELS' && Array.isArray(e.data.models)) {
       e.data.models.forEach((m) => {
         if (!m || !m.model) return;
@@ -1365,9 +1457,11 @@
     if (state.open) renderList();
   });
 
-  chrome.storage.local.get(['selectedEffort', 'selectedModel', 'learnedModels'], (data) => {
+  chrome.storage.local.get(['selectedEffort', 'selectedModel', 'learnedModels', 'oldChatUrl'], (data) => {
     state.effort = data.selectedEffort || null;
     state.model = data.selectedModel || null;
+    state.oldChatUrl = data.oldChatUrl || null;
+    renderOldChat();
     if (Array.isArray(data.learnedModels)) {
       learned = data.learnedModels.filter((l) => l && l.model);
       MODELS = merge(learned);
