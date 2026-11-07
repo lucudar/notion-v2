@@ -347,7 +347,7 @@
       .watchnote { padding: 0 10px 6px; font-size: 11px; color: #d6a74a; }
       .runs { max-height: 260px; }
       .oldrow { flex: none; padding: 8px 10px 0; display: flex; flex-direction: column; gap: 4px; border-top: 1px solid rgba(255,255,255,0.08); }
-      .oldrow .oldbtn { width: 100%; padding: 6px 8px; text-align: center; }
+      .oldrow .oldbtn, .oldrow .findbtn { width: 100%; padding: 6px 8px; text-align: center; }
       .oldnote { font-size: 11px; line-height: 1.35; color: #d6a74a; }
       .hidden { display: none !important; }
     </style>
@@ -388,6 +388,7 @@
       </div>
       <div class="oldrow">
         <button class="logbtn oldbtn" type="button">New old AI chat</button>
+        <button class="logbtn findbtn" type="button" title="Finds your onboarding chat (Welcome to Notion) in the chat list Notion has loaded and opens it">Find onboarding chat</button>
         <div class="oldnote hidden"></div>
       </div>
       <div class="foot">
@@ -424,6 +425,7 @@
   const chatBtn = shadow.querySelector('.chatbtn');
   const oldBtn = shadow.querySelector('.oldbtn');
   const oldNote = shadow.querySelector('.oldnote');
+  const findBtn = shadow.querySelector('.findbtn');
   const runsBox = shadow.querySelector('.runs');
   const runsBody = shadow.querySelector('.runsbody');
   const limBox = shadow.querySelector('.limits');
@@ -693,6 +695,47 @@
   oldBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     openOldChat();
+  });
+
+  // Onboarding chat: inject.js looks it up in the chat list Notion loaded.
+  let findTimer = 0;
+  function chatUrlFor(id) {
+    // Same address shape as the classic chat seen so far, with this thread.
+    try {
+      if (state.oldChatUrl) {
+        const u = new URL(state.oldChatUrl);
+        if (u.searchParams.has('t')) {
+          u.searchParams.set('t', id);
+          u.hash = '';
+          return u.href;
+        }
+      }
+    } catch (e) {}
+    return location.origin + '/chat?t=' + id;
+  }
+  function onOnboarding(d) {
+    clearTimeout(findTimer);
+    if (!d.found || !d.id) {
+      renderOldChat(d.reason === 'no-list'
+        ? 'The chat list has not loaded yet. Open Notion AI and its chat history (All chats / Recent), then press again.'
+        : 'No onboarding chat in the loaded list. Scroll the chat history down (it is one of the oldest), then press again.');
+      return;
+    }
+    const url = chatUrlFor(d.id);
+    if (sameChat(url, location.href)) {
+      renderOldChat('You are in the onboarding chat already.');
+      return;
+    }
+    renderOldChat('Opening "' + (d.title || 'onboarding chat') + '"…');
+    setOpen(false);
+    location.assign(url);
+  }
+  findBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    renderOldChat('Looking for the onboarding chat…');
+    clearTimeout(findTimer);
+    findTimer = setTimeout(() => renderOldChat('No answer from the page script. Reload the Notion tab and try again.'), 8000);
+    window.postMessage({ type: 'NOTION_EFFORT_FIND_ONBOARDING' }, '*');
   });
 
   watchBox.addEventListener('click', (e) => e.stopPropagation());
@@ -1420,6 +1463,8 @@
       state.seen = { url: e.data.url, via: e.data.via, reason: e.data.reason };
       if (!currentVerdict()) renderFoot();
     }
+
+    if (e.data.type === 'NOTION_EFFORT_ONBOARDING') onOnboarding(e.data);
 
     if (e.data.type === 'NOTION_EFFORT_OLD_CHAT' && typeof e.data.href === 'string' && isNotionUrl(e.data.href)) {
       if (state.oldChatUrl !== e.data.href) {
