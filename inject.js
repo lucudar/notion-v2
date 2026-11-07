@@ -2052,6 +2052,9 @@ let settings = {
     if (e.data.type === 'NOTION_EFFORT_RUNS_REQUEST') publishRuns();
     if (e.data.type === 'NOTION_EFFORT_FIND_ONBOARDING') findOnboarding();
     if (e.data.type === 'NOTION_EFFORT_CREATE_OLD_CHAT') createOldChat(e.data.text);
+    if (e.data.type === 'NOTION_EFFORT_OLD_CHAT_DEAD') {
+      trace('old chat', 'opened ' + String(e.data.id || '').slice(0, 8) + ' (saved as ' + (e.data.recordType || '?') + ') → Notion: no access at ' + shortUrl(e.data.url));
+    }
     if (e.data.type === 'NOTION_EFFORT_WATCH_ONLY') {
       watchOnly = !!e.data.on;
       try { localStorage.setItem(WATCH_KEY, watchOnly ? '1' : '0'); } catch (x) {}
@@ -2564,7 +2567,7 @@ let settings = {
   }
 
   async function drainOldChatStream(res) {
-    const out = { lines: 0, error: null, timedOut: false };
+    const out = { lines: 0, error: null, timedOut: false, shapes: [] };
     if (!res.body || !res.body.getReader) {
       await res.text().catch(() => '');
       return out;
@@ -2577,6 +2580,7 @@ let settings = {
       line = line.trim();
       if (!line) return;
       out.lines++;
+      if (out.shapes.length < 6) out.shapes.push(oldLineShape(line));
       if (!out.error) out.error = oldStreamError(line);
     };
     for (;;) {
@@ -2601,6 +2605,55 @@ let settings = {
     return out;
   }
 
+  // The created chat is only real once its thread record can be read back.
+  // Looked up in the send's workspace first, then in every other one seen,
+  // a few times (the server may save it a moment after the answer).
+  let lastOldChatAttempts = [];
+  window.__notionEffortOldChatDiag = function () {
+    return JSON.stringify(lastOldChatAttempts, null, 2);
+  };
+  async function findThreadRecord(threadId, spaceId) {
+    const id = dashedId(threadId);
+    const spaces = [dashedId(spaceId)].concat(
+      Object.keys(headersBySpace).map(dashedId).filter((s) => plainId(s) !== plainId(spaceId))
+    );
+    const waits = [0, 1500, 4000];
+    for (let w = 0; w < waits.length; w++) {
+      if (waits[w]) await new Promise((r) => setTimeout(r, waits[w]));
+      for (let i = 0; i < spaces.length; i++) {
+        const sid = spaces[i];
+        try {
+          const json = await apiPost('read new chat', sid, '/api/v3/syncRecordValues', {
+            requests: [{ pointer: { table: 'thread', id: id, spaceId: sid }, version: -1 }],
+          });
+          const t = json && json.recordMap && json.recordMap.thread;
+          const k = t && Object.keys(t)[0];
+          const v = k && unwrapRecord(t[k]);
+          if (v && v.id) {
+            return {
+              space: v.space_id || sid,
+              type: v.type || (v.data && v.data.type) || null,
+              parent: v.parent_table ? v.parent_table + ':' + plainId(v.parent_id).slice(0, 8) : null,
+              alive: v.alive !== false,
+            };
+          }
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+
+  /** Keys and type of one answer line, never its text. */
+  function oldLineShape(line) {
+    try {
+      const o = JSON.parse(line);
+      if (!o || typeof o !== 'object') return typeof o;
+      return Object.keys(o).slice(0, 8).join(',') + (typeof o.type === 'string' ? ' =' + o.type.slice(0, 40) : '');
+    } catch (e) {
+      return 'not JSON';
+    }
+  }
+
   async function createOldChat(text) {
     const report = (o) => window.postMessage(Object.assign({ type: 'NOTION_EFFORT_OLD_CHAT_CREATE' }, o), '*');
     if (window.top !== window) return;
@@ -2615,12 +2668,23 @@ let settings = {
       if (!spaceId && who) spaceId = who.spaceId;
       if (!spaceId) throw new Error('workspace not known yet, open any Notion page in this tab and try again');
       spaceId = dashedId(spaceId);
-      // The saved classic request goes first, as is; then the default body
-      // with the classic chat type, then the older workflow one.
-      const kinds = tpl ? [null, 'markdown-chat', 'workflow'] : ['markdown-chat', 'workflow'];
+      // Order: the saved classic request (exactly what Notion sent), then the
+      // default body, the type that worked last time first. An attempt counts
+      // only when the thread record can be read back: a 200 answer alone has
+      // opened dead links ("You don't have access to this chat").
+      const KIND_KEY = 'notionEffortOldChatKind';
+      let goodKind = null;
+      try { goodKind = localStorage.getItem(KIND_KEY); } catch (e) {}
+      const defaults = ['markdown-chat', 'workflow'];
+      const gi = goodKind ? defaults.indexOf(goodKind) : -1;
+      if (gi > 0) defaults.unshift(defaults.splice(gi, 1)[0]);
+      const kinds = tpl ? [null].concat(defaults) : defaults;
       let lastErr = null;
+      const attempts = [];
+      lastOldChatAttempts = attempts;
       for (let k = 0; k < kinds.length; k++) {
         const kind = kinds[k];
+        const way = kind || 'saved request';
         const threadId = crypto.randomUUID();
         const body = buildOldChatBody(kind ? null : tpl, kind, spaceId, threadId, text, who);
         const h = headersFor(spaceId);
@@ -2631,30 +2695,50 @@ let settings = {
           (!kind ? 'saved classic request (' + String(tpl.savedAt || '').slice(0, 16) + ')' : 'default body, type ' + kind) +
           ' · model ' + modelLabel(settings.model) + ' · effort ' + (settings.effort || 'Auto'));
         const path = (!kind && tpl.path) || '/api/v3/runInferenceTranscript';
+        const attempt = { way: way, thread: plainId(threadId), space: plainId(spaceId), http: null, lines: 0, shapes: [], error: null, record: null };
+        attempts.push(attempt);
         const res = await effortFetch(location.origin + path, {
           method: 'POST', credentials: 'include', headers: h, body: JSON.stringify(body),
         });
+        attempt.http = res.status;
         if (!res.ok) {
           const t = await res.text().catch(() => '');
           lastErr = 'HTTP ' + res.status + ' ' + t.slice(0, 200);
-          trace('old chat', 'create FAILED: ' + lastErr);
+          attempt.error = lastErr;
+          trace('old chat', 'create FAILED (' + way + '): ' + lastErr);
           continue;
         }
         report({ status: 'answering', id: plainId(threadId) });
         const r = await drainOldChatStream(res);
-        if (r.error) {
-          lastErr = r.error;
-          trace('old chat', 'create FAILED in the answer: ' + r.error);
-          if (k < kinds.length - 1) continue;
-          report({ status: 'error', id: plainId(threadId), error: r.error, fromTemplate: !!tpl });
-          return;
+        attempt.lines = r.lines;
+        attempt.shapes = r.shapes;
+        attempt.error = r.error;
+        report({ status: 'verifying', id: plainId(threadId) });
+        const rec = await findThreadRecord(threadId, spaceId);
+        attempt.record = rec;
+        if (!rec) {
+          lastErr = r.error
+            ? 'Notion refused: ' + r.error
+            : 'Notion answered (' + r.lines + ' lines) but did not save the chat';
+          trace('old chat', 'NOT saved (' + way + '): ' + lastErr + (r.shapes.length ? ' · answer: ' + r.shapes.join(' | ') : ''));
+          continue;
         }
-        trace('old chat', 'created ✓ ' + plainId(threadId).slice(0, 8) + ' (' + r.lines + ' stream lines' +
-          (r.timedOut ? ', answer still running after ' + OLD_CREATE_TIMEOUT / 1000 + ' s' : '') + ')');
-        report({ status: 'created', id: plainId(threadId), lines: r.lines, timedOut: r.timedOut, fromTemplate: !!tpl });
+        if (kind) {
+          try { localStorage.setItem(KIND_KEY, kind); } catch (e) {}
+        }
+        trace('old chat', 'created ✓ ' + plainId(threadId).slice(0, 8) + ' (' + way + ') · saved as ' + (rec.type || '?') +
+          (rec.parent ? ' under ' + rec.parent : '') + ' in workspace ' + plainId(rec.space).slice(0, 8) +
+          (r.timedOut ? ' · answer still running after ' + OLD_CREATE_TIMEOUT / 1000 + ' s' : ''));
+        report({
+          status: 'created', id: plainId(threadId), lines: r.lines, timedOut: r.timedOut,
+          fromTemplate: !kind, recordType: rec.type || null,
+        });
         return;
       }
-      report({ status: 'failed', error: lastErr, fromTemplate: !!tpl });
+      report({
+        status: 'failed', error: lastErr, fromTemplate: !!tpl,
+        tried: attempts.map((a) => a.way + ': ' + (a.http && a.http !== 200 ? 'HTTP ' + a.http : a.error ? 'refused' : 'not saved')).join(' · '),
+      });
     } catch (e) {
       const msg = String((e && e.message) || e).slice(0, 200);
       trace('old chat', 'create FAILED: ' + msg);
