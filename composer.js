@@ -355,7 +355,7 @@
         background: #1d1d1d; color: #e9e9e7; font-size: 12px; padding: 0 8px; outline: none;
       }
       .oldnew input:focus { border-color: #3b6ef0; }
-      .oldnew .createbtn { padding: 4px 8px; }
+      .oldnew .createbtn { width: auto; flex: none; padding: 4px 8px; }
       .oldnew .createbtn:disabled { opacity: 0.5; cursor: default; }
       .hidden { display: none !important; }
     </style>
@@ -395,12 +395,11 @@
         <div class="limbody"></div>
       </div>
       <div class="oldrow">
-        <button class="logbtn oldbtn" type="button">New old AI chat</button>
-        <button class="logbtn findbtn" type="button" title="Finds your onboarding chat (Welcome to Notion) in the chat list Notion has loaded and opens it">Find onboarding chat</button>
         <div class="oldnew">
           <input class="oldmsg" type="text" placeholder="First message (empty = Hi)" spellcheck="false">
-          <button class="logbtn createbtn" type="button" title="Creates a new classic Notion AI chat (runInferenceTranscript) with this first message and opens it">Create old AI chat</button>
+          <button class="logbtn oldbtn createbtn" type="button">New old AI chat</button>
         </div>
+        <button class="logbtn findbtn" type="button" title="Finds your onboarding chat (Welcome to Notion) in the chat list Notion has loaded and opens it">Find onboarding chat</button>
         <div class="oldnote hidden"></div>
       </div>
       <div class="foot">
@@ -608,8 +607,8 @@
   // neither. inject.js reports the page of every runInferenceTranscript call
   // (NOTION_EFFORT_OLD_CHAT). The button goes to that chat and presses
   // Notion's own "New chat" button in its header, so Notion itself creates
-  // the next chat; it sends nothing to Notion on its own. "Create old AI
-  // chat" is the exception: inject.js sends the first message itself.
+  // the next chat. Since 2.77 that is only the fallback: the button first
+  // asks inject.js to create the classic chat itself (first message included).
   const NOTION_ORIGINS = ['https://app.notion.com', 'https://www.notion.so', 'https://notion.so'];
   const PENDING_KEY = 'oldChatPending';
   const PENDING_TTL = 30000;
@@ -633,9 +632,8 @@
     }
   }
   function renderOldChat(note) {
-    oldBtn.title = state.oldChatUrl
-      ? 'Opens the classic Notion AI chat and presses its New chat button: ' + state.oldChatUrl
-      : 'Open the classic Notion AI chat once and send a message there: the button learns where it is.';
+    oldBtn.title = 'Creates a new classic Notion AI chat itself (first message from the field, empty = Hi) and opens it' +
+      (state.oldChatUrl ? '. Fallback: ' + state.oldChatUrl : '');
     oldNote.textContent = note || '';
     oldNote.classList.toggle('hidden', !note);
   }
@@ -707,10 +705,6 @@
     if (!sameChat(pending.url, location.href)) return;
     newChatHere(15000);
   }
-  oldBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    openOldChat();
-  });
 
   // Onboarding chat: inject.js looks it up in the chat list Notion loaded.
   let findTimer = 0;
@@ -760,7 +754,7 @@
   let createTimer = 0;
   function setCreating(on) {
     createBtn.disabled = on;
-    createBtn.textContent = on ? 'Creating…' : 'Create old AI chat';
+    createBtn.textContent = on ? 'Creating…' : 'New old AI chat';
   }
   function armCreateTimer(ms) {
     clearTimeout(createTimer);
@@ -797,6 +791,12 @@
       renderOldChat('Created' + (d.timedOut ? ' (the answer is still running)' : '') + '. Opening…');
       setOpen(false);
       location.assign(chatUrlFor(d.id));
+      return;
+    }
+    if (state.oldChatUrl && isNotionUrl(state.oldChatUrl)) {
+      // Direct creation failed: go the old way (open the known classic chat
+      // and press Notion's New chat there). The reason is in Log.
+      openOldChat();
       return;
     }
     const hint = d.fromTemplate
