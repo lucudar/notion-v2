@@ -666,7 +666,7 @@
     renderOldChat();
     const saved = state.oldChatUrl;
     if (!saved || !isNotionUrl(saved)) {
-      renderOldChat('No classic chat known yet. Open it once (for example "Welcome to Notion") and send a message: after that this button makes new ones from there.');
+      renderOldChat('No classic chat known yet in this Notion (browser and desktop remember separately). Press "Find onboarding chat", or open the classic chat yourself and send one message there: the footer should then say "patched" or "already matched". After that this button makes new ones from there.');
       return;
     }
     setOpen(false);
