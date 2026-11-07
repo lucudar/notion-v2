@@ -791,6 +791,11 @@
       armCreateTimer(60000);
       return;
     }
+    if (d.status === 'verifying') {
+      armCreateTimer(30000);
+      renderOldChat('Checking that Notion saved the chat…');
+      return;
+    }
     if (d.status === 'answering') {
       armCreateTimer(160000);
       renderOldChat('Chat created, Notion is writing the first answer. It opens when the answer is done.');
@@ -804,9 +809,19 @@
     setCreating(false);
     if (d.status === 'created' && d.id) {
       oldMsg.value = '';
-      renderOldChat('Created' + (d.timedOut ? ' (the answer is still running)' : '') + '. Opening…');
+      renderOldChat('Created and saved by Notion' + (d.timedOut ? ' (the answer is still running)' : '') + '. Opening…');
       setOpen(false);
-      location.assign(chatUrlFor(d.id));
+      const url = chatUrlFor(d.id);
+      let gone = false;
+      const go = () => {
+        if (gone) return;
+        gone = true;
+        location.assign(url);
+      };
+      try {
+        chrome.storage.local.set({ oldChatOpened: { at: Date.now(), id: d.id, type: d.recordType || null } }, go);
+      } catch (x) {}
+      setTimeout(go, 400);
       return;
     }
     if (state.oldChatUrl && isNotionUrl(state.oldChatUrl)) {
@@ -818,13 +833,34 @@
     const hint = d.fromTemplate
       ? ''
       : ' No classic chat request was seen in this browser yet, so a default one was sent. Send one message in a classic chat (footer says "patched" or "already matched") and try again.';
-    renderOldChat('Could not create a classic chat: ' + (d.error || 'unknown error') + '.' + hint + ' Steps: Log.');
+    renderOldChat('Could not create a classic chat: ' + (d.error || 'unknown error') + '.' +
+      (d.tried ? ' Tried: ' + d.tried + '.' : '') + hint + ' Steps: Log; details: copy(__notionEffortOldChatDiag()).');
   }
   createBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     createOldChatNow();
   });
   oldMsg.addEventListener('click', (e) => e.stopPropagation());
+
+  // After opening a freshly created chat: if Notion says it cannot open it,
+  // say so in the panel instead of leaving a dead page.
+  const NO_ACCESS = /(don.t|do not) have access to this chat|нет доступа к этому чату/i;
+  function checkOpenedOldChat(opened) {
+    if (!opened || !opened.at || Date.now() - opened.at > 60000) return;
+    chrome.storage.local.set({ oldChatOpened: null });
+    if (location.href.replace(/-/g, '').indexOf(opened.id) === -1) return;
+    const started = Date.now();
+    (function tick() {
+      if (NO_ACCESS.test(document.body ? document.body.innerText || '' : '')) {
+        setOpen(true);
+        renderOldChat('The chat was created and Notion saved it (' + (opened.type || 'type ?') + ', id ' + opened.id.slice(0, 8) +
+          '), but this address does not open it. Open any classic Notion AI chat once and send a message there: the button then learns the right address. Details: Log.');
+        window.postMessage({ type: 'NOTION_EFFORT_OLD_CHAT_DEAD', id: opened.id, url: location.href, recordType: opened.type || null }, '*');
+        return;
+      }
+      if (Date.now() - started < 12000) setTimeout(tick, 500);
+    })();
+  }
   ['keydown', 'keyup', 'keypress', 'input', 'beforeinput', 'paste', 'copy', 'cut'].forEach((t) =>
     oldMsg.addEventListener(t, (e) => {
       e.stopPropagation();
@@ -1743,12 +1779,13 @@
     if (state.open) renderList();
   });
 
-  chrome.storage.local.get(['selectedEffort', 'selectedModel', 'learnedModels', 'oldChatUrl', PENDING_KEY], (data) => {
+  chrome.storage.local.get(['selectedEffort', 'selectedModel', 'learnedModels', 'oldChatUrl', 'oldChatOpened', PENDING_KEY], (data) => {
     state.effort = data.selectedEffort || null;
     state.model = data.selectedModel || null;
     state.oldChatUrl = data.oldChatUrl || null;
     renderOldChat();
     resumePendingNewChat(data[PENDING_KEY]);
+    setTimeout(() => checkOpenedOldChat(data.oldChatOpened), 1500);
     if (Array.isArray(data.learnedModels)) {
       learned = data.learnedModels.filter((l) => l && l.model);
       MODELS = merge(learned);
