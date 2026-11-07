@@ -2384,10 +2384,12 @@ let settings = {
     return all[0] || null;
   }
 
-  function publishOnboarding(reason) {
+  function publishOnboarding(reason, stats) {
     const best = bestOnboarding();
     window.postMessage({
       type: 'NOTION_EFFORT_ONBOARDING',
+      pages: stats ? stats.pages : null,
+      total: stats ? stats.records : null,
       found: !!best,
       id: best ? best.id : null,
       title: best ? best.title : null,
@@ -2397,14 +2399,82 @@ let settings = {
     }, '*');
   }
 
-  function findOnboarding() {
+  // Next-page token of a chat-list answer, whatever Notion calls it.
+  function listCursorOf(json) {
+    if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+    if (json.hasMore === false || json.has_more === false) return null;
+    const keys = Object.keys(json);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (/cursor/i.test(k) && json[k] != null && json[k] !== '') return { key: k, value: json[k] };
+    }
+    return null;
+  }
+
+  // Every page of the chat list, in every workspace seen: Notion itself only
+  // loads the newest few, and the onboarding chat is one of the oldest.
+  // Replays Notion's own list request (bigger page, next cursor).
+  async function readAllChatLists() {
+    const base = lastThreadList;
+    const stats = { pages: 0, records: 0 };
+    const hasSpace = base.body && typeof base.body === 'object' && 'spaceId' in base.body;
+    const spaces = [base.spaceId].concat(Object.keys(headersBySpace)).filter(Boolean).map(dashedId)
+      .filter((s, i, a) => a.findIndex((x) => plainId(x) === plainId(s)) === i);
+    if (!spaces.length) spaces.push(null);
+    for (let s = 0; s < spaces.length; s++) {
+      if (s > 0 && !hasSpace) break;
+      const sid = spaces[s];
+      let body = cloneJson(base.body || {});
+      if (hasSpace && sid) body.spaceId = sid;
+      if (typeof body.limit === 'number') body.limit = Math.max(body.limit, 100);
+      const cursorKey = Object.keys(body).find((k) => /cursor/i.test(k)) || null;
+      for (let p = 0; p < 15; p++) {
+        let json;
+        try {
+          json = await apiPost('chat list', sid, base.path, body);
+        } catch (e) {
+          trace('onboarding', 'chat list read failed in ' + plainId(sid).slice(0, 8) + ': ' + String((e && e.message) || e).slice(0, 120));
+          break;
+        }
+        stats.pages++;
+        stats.records += threadRecords(json, true).length;
+        noteChatList(json, base.path);
+        scanForOnboarding(json, true);
+        if (bestOnboarding()) return stats;
+        const c = listCursorOf(json);
+        if (!c) break;
+        const key = cursorKey || c.key;
+        if (JSON.stringify(body[key]) === JSON.stringify(c.value)) break;
+        body = Object.assign({}, body);
+        body[key] = c.value;
+      }
+    }
+    return stats;
+  }
+
+  let findingOnboarding = false;
+  async function findOnboarding() {
     if (bestOnboarding()) { publishOnboarding(null); return; }
-    if (!lastThreadList) { publishOnboarding('no-list'); return; }
-    const spaceId = lastThreadList.spaceId || Object.keys(headersBySpace)[0] || null;
-    apiPost('chat list', spaceId, lastThreadList.path, lastThreadList.body)
-      .then((json) => { noteChatList(json, lastThreadList.path); scanForOnboarding(json, true); })
-      .catch((e) => console.warn('[Notion Effort] chat list re-read failed:', e && e.message))
-      .then(() => publishOnboarding('not-in-list'));
+    if (!lastThreadList) {
+      trace('onboarding', 'Notion has not loaded a chat list in this tab yet: nothing to search');
+      publishOnboarding('no-list');
+      return;
+    }
+    if (findingOnboarding) return;
+    findingOnboarding = true;
+    let stats = { pages: 0, records: 0 };
+    try {
+      stats = await readAllChatLists();
+    } catch (e) {
+      console.warn('[Notion Effort] chat list re-read failed:', e && e.message);
+    } finally {
+      findingOnboarding = false;
+    }
+    const best = bestOnboarding();
+    trace('onboarding', best
+      ? 'found ' + best.id.slice(0, 8) + ' after ' + stats.pages + ' list pages'
+      : 'not found in ' + stats.records + ' chats over ' + stats.pages + ' list pages');
+    publishOnboarding(best ? null : 'not-in-list', stats);
   }
 
 
