@@ -413,7 +413,7 @@
           <input class="oldmsg" type="text" placeholder="First message (empty = Hi)" spellcheck="false">
           <button class="logbtn oldbtn createbtn" type="button">New old AI chat</button>
         </div>
-        <button class="logbtn findbtn" type="button" title="Finds your onboarding chat (Welcome to Notion) in the chat list Notion has loaded and opens it">Find onboarding chat</button>
+        <button class="logbtn findbtn" type="button" title="Looks for your onboarding chat (Welcome to Notion) in every page of your chat lists and opens it. If there is none, creates a new classic chat (first message from the field above)">Find onboarding chat or create</button>
         <div class="oldnote hidden"></div>
       </div>
       <div class="foot">
@@ -741,9 +741,12 @@
   function onOnboarding(d) {
     clearTimeout(findTimer);
     if (!d.found || !d.id) {
-      renderOldChat(d.reason === 'no-list'
-        ? 'The chat list has not loaded yet. Open Notion AI and its chat history (All chats / Recent), then press again.'
-        : 'No onboarding chat among ' + (d.listed == null ? 'the' : d.listed) + ' chats in the loaded list. Scroll the chat history down (it is one of the oldest) and press again. Still nothing: run copy(__notionEffortChatList()) in DevTools and send the result.');
+      // Not there: make a classic chat instead, so the button always ends in a chat.
+      const where = d.reason === 'no-list'
+        ? 'Notion has not loaded your chat list in this tab'
+        : 'not among ' + (d.total != null ? d.total : d.listed != null ? d.listed : 'the') + ' chats' + (d.pages ? ' (' + d.pages + ' list pages)' : '');
+      renderOldChat('No onboarding chat: ' + where + '. Creating a new classic chat…');
+      createOldChatNow(true);
       return;
     }
     const url = chatUrlFor(d.id);
@@ -757,9 +760,9 @@
   }
   findBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    renderOldChat('Looking for the onboarding chat…');
+    renderOldChat('Looking for the onboarding chat in all your chat lists…');
     clearTimeout(findTimer);
-    findTimer = setTimeout(() => renderOldChat('No answer from the page script. Reload the Notion tab and try again.'), 8000);
+    findTimer = setTimeout(() => renderOldChat('No answer from the page script. Reload the Notion tab and try again.'), 60000);
     window.postMessage({ type: 'NOTION_EFFORT_FIND_ONBOARDING' }, '*');
   });
 
@@ -779,10 +782,10 @@
       renderOldChat('No answer from the page script. Reload the Notion tab and try again.');
     }, ms);
   }
-  function createOldChatNow() {
+  function createOldChatNow(keepNote) {
     if (createBtn.disabled) return;
     setCreating(true);
-    renderOldChat('Creating a classic chat…');
+    if (keepNote !== true) renderOldChat('Creating a classic chat…');
     armCreateTimer(10000);
     window.postMessage({ type: 'NOTION_EFFORT_CREATE_OLD_CHAT', text: oldMsg.value }, '*');
   }
