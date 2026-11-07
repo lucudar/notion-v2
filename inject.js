@@ -365,9 +365,12 @@ let settings = {
 
   // The classic chat is the one that still sends runInferenceTranscript (model
   // and effort live in its body). Tell the panel which page that was, so its
-  // "Open old AI chat" button can return there. Top frame only.
-  function noteOldChat(url) {
-    if (window.top !== window || !/runInferenceTranscript/i.test(String(url || ''))) return;
+  // "New old AI chat" button can return there. sure = the body carried a
+  // transcript config we could patch, whatever the endpoint is called (the
+  // agent chat never does). Top frame only.
+  function noteOldChat(url, sure) {
+    if (window.top !== window) return;
+    if (!sure && !/runInferenceTranscript/i.test(String(url || ''))) return;
     window.postMessage({ type: 'NOTION_EFFORT_OLD_CHAT', href: location.href }, '*');
   }
 
@@ -608,6 +611,7 @@ let settings = {
       return originalFetch.apply(this, args);
     }
     noteSeen(url, 'fetch', result.modified ? 'patched' : 'already matched');
+    noteOldChat(url, true);
 
     if (!result.modified) {
       // No swap (Auto, or the body already matched). Still read the answer so
@@ -663,6 +667,7 @@ let settings = {
         interceptedCount++;
         const body = JSON.parse(data);
         const result = patchPayload(body);
+        if (result) noteOldChat(url, true);
         noteSeen(
           url,
           'xhr',
