@@ -387,7 +387,7 @@
         <div class="limbody"></div>
       </div>
       <div class="oldrow">
-        <button class="logbtn oldbtn" type="button">Open old AI chat</button>
+        <button class="logbtn oldbtn" type="button">New old AI chat</button>
         <div class="oldnote hidden"></div>
       </div>
       <div class="foot">
@@ -590,12 +590,14 @@
   // The classic Notion AI chat sends /api/v3/runInferenceTranscript: that is
   // where model and effort get swapped. The new chat (agent threads) carries
   // neither. inject.js reports the page of every runInferenceTranscript call
-  // (NOTION_EFFORT_OLD_CHAT), so this button can return there. Until one has
-  // been seen it falls back to Notion's own AI shortcut (Ctrl/Cmd+J).
+  // (NOTION_EFFORT_OLD_CHAT). The button goes to that chat and presses
+  // Notion's own "New chat" button in its header, so Notion itself creates
+  // the next chat. The extension sends nothing to Notion on its own here.
   const NOTION_ORIGINS = ['https://app.notion.com', 'https://www.notion.so', 'https://notion.so'];
-  function isMac() {
-    return /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent || '');
-  }
+  const PENDING_KEY = 'oldChatPending';
+  const PENDING_TTL = 30000;
+  const NEW_CHAT_LABEL = /^(new (ai )?chat|start (a )?new chat|новый чат|создать чат)$/i;
+
   function isNotionUrl(href) {
     try {
       const o = new URL(href).origin;
@@ -604,54 +606,89 @@
       return false;
     }
   }
+  /** Same chat: same origin + path and the same thread (?t=). */
+  function sameChat(a, b) {
+    try {
+      const x = new URL(a), y = new URL(b);
+      return x.origin === y.origin && x.pathname === y.pathname && x.searchParams.get('t') === y.searchParams.get('t');
+    } catch (e) {
+      return false;
+    }
+  }
   function renderOldChat(note) {
     oldBtn.title = state.oldChatUrl
-      ? 'Opens the last classic Notion AI chat: ' + state.oldChatUrl
-      : 'Opens the classic Notion AI chat (' + (isMac() ? '⌘J' : 'Ctrl+J') + '). Send one message there and the button remembers it.';
+      ? 'Opens the classic Notion AI chat and presses its New chat button: ' + state.oldChatUrl
+      : 'Open the classic Notion AI chat once and send a message there: the button learns where it is.';
     oldNote.textContent = note || '';
     oldNote.classList.toggle('hidden', !note);
   }
-  function countComposers() {
-    let n = 0;
-    document.querySelectorAll('[contenteditable="true"][role="textbox"], textarea').forEach((el) => {
-      const r = el.getBoundingClientRect();
-      if (r.width >= 180 && r.height >= 16 && r.bottom >= 0 && r.top <= window.innerHeight) n++;
-    });
-    return n;
+  function labelOf(el) {
+    return (el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '').trim().replace(/\s+/g, ' ');
   }
-  function pressAiShortcut() {
-    const mac = isMac();
-    const init = { key: 'j', code: 'KeyJ', keyCode: 74, which: 74, ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true, composed: true };
-    const target = document.body || document.documentElement;
-    target.dispatchEvent(new KeyboardEvent('keydown', init));
-    target.dispatchEvent(new KeyboardEvent('keyup', init));
+  /** Notion's own "New chat" control: matched by its label, topmost visible one wins. */
+  function findNewChatButton() {
+    let best = null;
+    document.querySelectorAll('[role="button"], button, a').forEach((el) => {
+      if (!NEW_CHAT_LABEL.test(labelOf(el))) return;
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8 || r.bottom < 0 || r.top > window.innerHeight) return;
+      if (!best || r.top < best.top) best = { el, top: r.top };
+    });
+    return best ? best.el : null;
+  }
+  function clickNewChat(timeoutMs) {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      (function tick() {
+        const btn = findNewChatButton();
+        if (btn) {
+          btn.click();
+          resolve(true);
+          return;
+        }
+        if (Date.now() - started > timeoutMs) {
+          resolve(false);
+          return;
+        }
+        setTimeout(tick, 300);
+      })();
+    });
+  }
+  async function newChatHere(timeoutMs) {
+    const ok = await clickNewChat(timeoutMs);
+    if (ok) return;
+    setOpen(true);
+    renderOldChat('Notion\'s "New chat" button was not found on this page. Press it in the chat header yourself.');
   }
   function openOldChat() {
     renderOldChat();
     const saved = state.oldChatUrl;
-    if (saved && saved !== location.href && isNotionUrl(saved)) {
-      setOpen(false);
-      location.assign(saved);
+    if (!saved || !isNotionUrl(saved)) {
+      renderOldChat('No classic chat known yet. Open it once (for example "Welcome to Notion") and send a message: after that this button makes new ones from there.');
       return;
     }
-    if (saved && saved === location.href) {
-      // Already in it: just put the cursor in the composer.
-      setOpen(false);
-      const found = findComposer();
-      if (found) found.el.focus({ preventScroll: true });
-      return;
-    }
-    const before = location.href + '|' + countComposers();
     setOpen(false);
-    pressAiShortcut();
-    setTimeout(() => {
-      if (location.href + '|' + countComposers() !== before) return;
-      setOpen(true);
-      renderOldChat(
-        'Notion did not open the AI chat. Press ' + (isMac() ? '⌘J' : 'Ctrl+J') +
-        ' or open Notion AI from the sidebar and send one message: the button will remember that chat.'
-      );
-    }, 900);
+    if (sameChat(saved, location.href)) {
+      newChatHere(8000);
+      return;
+    }
+    // Remember the intent across the page load, then go to the classic chat.
+    let gone = false;
+    const go = () => {
+      if (gone) return;
+      gone = true;
+      location.assign(saved);
+    };
+    try {
+      chrome.storage.local.set({ [PENDING_KEY]: { at: Date.now(), url: saved } }, go);
+    } catch (e) {}
+    setTimeout(go, 400);
+  }
+  function resumePendingNewChat(pending) {
+    if (!pending || !pending.at || Date.now() - pending.at > PENDING_TTL) return;
+    chrome.storage.local.set({ [PENDING_KEY]: null });
+    if (!sameChat(pending.url, location.href)) return;
+    newChatHere(15000);
   }
   oldBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1457,11 +1494,12 @@
     if (state.open) renderList();
   });
 
-  chrome.storage.local.get(['selectedEffort', 'selectedModel', 'learnedModels', 'oldChatUrl'], (data) => {
+  chrome.storage.local.get(['selectedEffort', 'selectedModel', 'learnedModels', 'oldChatUrl', PENDING_KEY], (data) => {
     state.effort = data.selectedEffort || null;
     state.model = data.selectedModel || null;
     state.oldChatUrl = data.oldChatUrl || null;
     renderOldChat();
+    resumePendingNewChat(data[PENDING_KEY]);
     if (Array.isArray(data.learnedModels)) {
       learned = data.learnedModels.filter((l) => l && l.model);
       MODELS = merge(learned);
