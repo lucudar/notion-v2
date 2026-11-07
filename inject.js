@@ -2040,6 +2040,7 @@ let settings = {
   window.addEventListener('message', (e) => {
     if (e.source !== window || !e.data) return;
     if (e.data.type === 'NOTION_EFFORT_RUNS_REQUEST') publishRuns();
+    if (e.data.type === 'NOTION_EFFORT_FIND_ONBOARDING') findOnboarding();
     if (e.data.type === 'NOTION_EFFORT_WATCH_ONLY') {
       watchOnly = !!e.data.on;
       try { localStorage.setItem(WATCH_KEY, watchOnly ? '1' : '0'); } catch (x) {}
@@ -2262,6 +2263,108 @@ let settings = {
     return dump;
   };
 
+  // ---- Onboarding chat finder ---------------------------------------------
+  //
+  // The onboarding chat ("Welcome to Notion") is a classic chat. Thread
+  // records passing through chat-list / record responses are scanned for it,
+  // and the panel's "Find onboarding chat" button opens the best match.
+  // Read-only: at most it repeats the chat-list request Notion itself sent.
+  const THREAD_LIST_URL = /\/api\/v3\/(getInferenceTranscriptsForUser|syncRecordValues)/;
+  const ONBOARD_RE = /onboard|unboxing|briefing|welcome to notion|добро пожаловать/i;
+  const STRONG_RE = /onboard|unboxing|briefing/i;
+  const onboardingThreads = {};
+  window.__notionEffortOnboarding = onboardingThreads;
+  let lastThreadList = null; // { path, spaceId, body }: Notion's own last chat-list request
+
+  function noteThreadListRequest(url, opts) {
+    if (!/getInferenceTranscriptsForUser/.test(url) || !opts || typeof opts.body !== 'string') return;
+    try {
+      const body = JSON.parse(opts.body);
+      let spaceId = body.spaceId || null;
+      if (!spaceId && opts.headers) {
+        try { spaceId = new Headers(opts.headers).get('x-notion-space-id'); } catch (e) {}
+      }
+      lastThreadList = { path: url.replace(location.origin, '').split('#')[0], spaceId: spaceId, body: body };
+    } catch (e) {}
+  }
+
+  function findRecords(node, path, depth, out) {
+    if (!node || typeof node !== 'object' || depth > 12) return;
+    if (!Array.isArray(node) && typeof node.id === 'string' && UUID.test(node.id)) out.push({ node: node, path: path });
+    const keys = Array.isArray(node) ? node.map((_, i) => i) : Object.keys(node);
+    for (const k of keys) findRecords(node[k], path + '/' + k, depth + 1, out);
+  }
+
+  /** Short string values of this record itself, not of records nested in it. */
+  function ownStrings(node, depth, out) {
+    if (!node || typeof node !== 'object' || depth > 3) return out;
+    Object.keys(node).slice(0, 80).forEach((k) => {
+      const v = node[k];
+      if (typeof v === 'string') { if (v.length <= 120) out.push(v); }
+      else if (v && typeof v === 'object' && !(v.id && !Array.isArray(v))) ownStrings(v, depth + 1, out);
+    });
+    return out;
+  }
+
+  function scanForOnboarding(json, fromList) {
+    const found = [];
+    findRecords(json, '', 0, found);
+    found.forEach((f) => {
+      // syncRecordValues: only thread records. Chat list: only top-level items,
+      // not the steps/messages nested inside them.
+      if (fromList ? f.path.split('/').length > 5 : !/\/thread\//.test(f.path)) return;
+      const words = ownStrings(f.node, 0, []);
+      const hit = words.find((w) => ONBOARD_RE.test(w));
+      if (!hit) return;
+      const key = plainId(f.node.id);
+      const prev = onboardingThreads[key];
+      onboardingThreads[key] = {
+        id: key,
+        title: typeof f.node.title === 'string' ? f.node.title : (prev && prev.title) || hit.slice(0, 80),
+        strong: words.some((w) => STRONG_RE.test(w)) || !!(prev && prev.strong),
+        at: Number(f.node.created_time || f.node.createdAt || f.node.last_edited_time || 0) || (prev && prev.at) || 0,
+        path: f.path.slice(0, 120),
+      };
+    });
+  }
+
+  function watchThreadList(response) {
+    if (!response || !response.ok) return Promise.resolve();
+    const fromList = /getInferenceTranscriptsForUser/.test(response.url || '');
+    return response.clone().text().then((text) => {
+      if (!ONBOARD_RE.test(text)) return;
+      scanForOnboarding(JSON.parse(text), fromList);
+    }).catch(() => {});
+  }
+
+  function bestOnboarding() {
+    const all = Object.keys(onboardingThreads).map((k) => onboardingThreads[k]);
+    all.sort((a, b) => (Number(b.strong) - Number(a.strong)) || (b.at - a.at));
+    return all[0] || null;
+  }
+
+  function publishOnboarding(reason) {
+    const best = bestOnboarding();
+    window.postMessage({
+      type: 'NOTION_EFFORT_ONBOARDING',
+      found: !!best,
+      id: best ? best.id : null,
+      title: best ? best.title : null,
+      count: Object.keys(onboardingThreads).length,
+      reason: best ? null : reason,
+    }, '*');
+  }
+
+  function findOnboarding() {
+    if (bestOnboarding()) { publishOnboarding(null); return; }
+    if (!lastThreadList) { publishOnboarding('no-list'); return; }
+    const spaceId = lastThreadList.spaceId || Object.keys(headersBySpace)[0] || null;
+    apiPost('chat list', spaceId, lastThreadList.path, lastThreadList.body)
+      .then((json) => scanForOnboarding(json, true))
+      .catch((e) => console.warn('[Notion Effort] chat list re-read failed:', e && e.message))
+      .then(() => publishOnboarding('not-in-list'));
+  }
+
   const effortFetch = window.fetch;
   window.fetch = function (...args) {
     let url = '';
@@ -2271,6 +2374,10 @@ let settings = {
     const watch = (p) => {
       p.then((res) => deepResponse(url, res), () => {});
       if (AGENT_RECORD_URL.test(url)) p.then(watchAgentResponse, () => {});
+      if (THREAD_LIST_URL.test(url)) {
+        noteThreadListRequest(url, opts);
+        p.then(watchThreadList, () => {});
+      }
       if (PREF_URL.test(url)) p.then(watchPrefResponse, () => {});
       return p;
     };
