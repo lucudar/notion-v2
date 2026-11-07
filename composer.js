@@ -718,7 +718,7 @@
     if (!d.found || !d.id) {
       renderOldChat(d.reason === 'no-list'
         ? 'The chat list has not loaded yet. Open Notion AI and its chat history (All chats / Recent), then press again.'
-        : 'No onboarding chat in the loaded list. Scroll the chat history down (it is one of the oldest), then press again.');
+        : 'No onboarding chat among ' + (d.listed == null ? 'the' : d.listed) + ' chats in the loaded list. Scroll the chat history down (it is one of the oldest) and press again. Still nothing: run copy(__notionEffortChatList()) in DevTools and send the result.');
       return;
     }
     const url = chatUrlFor(d.id);
