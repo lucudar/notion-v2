@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Notion AI Effort Control",
-  "version": "2.78",
+  "version": "2.79",
   "description": "Control AI model and reasoning effort in Notion + restore the model selector hidden on business trials",
   "permissions": ["storage", "activeTab", "alarms", "scripting", "cookies"],
   "host_permissions": [
