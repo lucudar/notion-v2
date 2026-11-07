@@ -334,7 +334,18 @@
       .logbody .bad { color: #eb8a86; }
       .logbody .good { color: #7fc99a; }
       .runs { flex: none; border-top: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; max-height: 260px; }
-      .limits { flex: none; border-top: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; max-height: 260px; }
+      .limits { flex: none; border-top: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; max-height: 420px; }
+      .credits { padding: 4px 10px 6px; display: flex; flex-direction: column; gap: 6px; flex: none; max-height: 190px; overflow-y: auto; }
+      .credits .cnote { font-size: 11px; line-height: 1.35; color: #8b8b87; }
+      .credits .ccard { border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; padding: 6px 8px; }
+      .credits .ctitle { font-size: 11px; font-weight: 600; color: #c8c8c4; margin-bottom: 4px; }
+      .credits .cpct { font-size: 12px; font-weight: 600; color: #e9e9e7; }
+      .credits .cbar { height: 6px; border-radius: 3px; background: rgba(255,255,255,0.1); overflow: hidden; margin: 3px 0 5px; }
+      .credits .cbar > i { display: block; height: 100%; background: #4cb782; }
+      .credits .cbar.warn > i { background: #d6a74a; }
+      .credits .cbar.bad > i { background: #eb645f; }
+      .credits .crow { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: #8b8b87; }
+      .credits .crow b { color: #e9e9e7; font-weight: 500; text-align: right; word-break: break-word; }
       .limbody { overflow-y: auto; padding: 0 10px 8px; font-size: 11.5px; color: #c8c8c4; }
       .limbody .lrow { display: flex; align-items: baseline; gap: 6px; padding: 2px 0; }
       .limbody .lname { flex: none; max-width: 118px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -405,7 +416,8 @@
         <div class="logbody"></div>
       </div>
       <div class="limits hidden">
-        <div class="logbar"><span>Limits (workspace catalogue)</span><span class="limsum"></span></div>
+        <div class="logbar"><span>Credits &amp; limits</span><span class="limsum"></span></div>
+        <div class="credits"></div>
         <div class="limbody"></div>
       </div>
       <div class="oldrow">
@@ -459,6 +471,7 @@
   const runsBody = shadow.querySelector('.runsbody');
   const limBox = shadow.querySelector('.limits');
   const limBody = shadow.querySelector('.limbody');
+  const creditsBox = shadow.querySelector('.credits');
   const limSum = shadow.querySelector('.limsum');
   const limBtn = shadow.querySelector('.limbtn');
   const watchBox = shadow.querySelector('.watchbox');
@@ -514,6 +527,97 @@
   }
 
   /** Effort ceiling and flags as the workspace catalogue reported them. */
+  // ---------------------------------------------------------------- credits
+  //
+  // Usage figures Notion sent (inject.js keeps every answer whose fields look
+  // like credits / usage / limits / reset time). Shown as found: a percent bar
+  // when the numbers allow it, then the fields themselves, dates as local time.
+  let usageEntries = [];
+  let usageNote = null;
+  const PCT_RE = /percent|pct/i;
+  const WHEN_RE = /reset|expire|until|end|start|renew|time|date|period|at$/i;
+
+  function whenText(ms) {
+    if (!isFinite(ms)) return '?';
+    const diff = ms - Date.now();
+    const abs = Math.abs(diff);
+    const h = Math.floor(abs / 3600000);
+    const m = Math.floor((abs % 3600000) / 60000);
+    const rel = h >= 48 ? Math.round(h / 24) + ' d' : h ? h + ' h ' + m + ' min' : m + ' min';
+    return new Date(ms).toLocaleString() + (diff >= 0 ? ' (in ' + rel + ')' : ' (' + rel + ' ago)');
+  }
+  function usageKey(path) {
+    const parts = String(path).replace(/\[\d+\]/g, '').split('.').filter(Boolean);
+    return parts.slice(-2).join(' › ').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ');
+  }
+  function usageValue(path, v) {
+    if (typeof v === 'number' && WHEN_RE.test(path) && v > 1e9) return whenText(v > 1e12 ? v : v * 1000);
+    if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) return whenText(Date.parse(v));
+    if (typeof v === 'number' && PCT_RE.test(path)) return Math.round((v <= 1 && !Number.isInteger(v) ? v * 100 : v) * 10) / 10 + '%';
+    if (typeof v === 'number') return v.toLocaleString();
+    return String(v);
+  }
+  function usagePercent(fields) {
+    const num = (re, not) => fields.find((f) => typeof f.value === 'number' && re.test(f.path) && !(not && not.test(f.path)));
+    const pct = num(PCT_RE);
+    if (pct) return pct.value <= 1 && !Number.isInteger(pct.value) ? pct.value * 100 : pct.value;
+    const lim = num(/(limit|total|quota|allowance|max|cap)/i, /(used|consumed|spent|remaining|percent|pct|reset)/i);
+    const used = num(/(used|consumed|spent)/i, /percent|pct/i);
+    if (used && lim && lim.value > 0) return (used.value / lim.value) * 100;
+    const rem = num(/remaining/i, /percent|pct/i);
+    if (rem && lim && lim.value > 0) return (1 - rem.value / lim.value) * 100;
+    return null;
+  }
+  function renderCredits() {
+    creditsBox.textContent = '';
+    if (!usageEntries.length) {
+      const p = document.createElement('div');
+      p.className = 'cnote';
+      p.textContent = usageNote || 'Credits: reading usage from Notion…';
+      creditsBox.appendChild(p);
+      return;
+    }
+    usageEntries.forEach((e) => {
+      const card = document.createElement('div');
+      card.className = 'ccard';
+      const title = document.createElement('div');
+      title.className = 'ctitle';
+      title.textContent = 'Credits · ' + String(e.url).replace(/^\/api\/v3\//, '') + ' · ' + new Date(e.at).toLocaleTimeString();
+      card.appendChild(title);
+      const pct = usagePercent(e.fields || []);
+      if (pct != null && isFinite(pct)) {
+        const p = Math.max(0, Math.min(100, pct));
+        const line = document.createElement('div');
+        line.className = 'cpct';
+        line.textContent = Math.round(p) + '% used · ' + Math.round(100 - p) + '% left';
+        const bar = document.createElement('div');
+        bar.className = 'cbar' + (p >= 90 ? ' bad' : p >= 70 ? ' warn' : '');
+        const fill = document.createElement('i');
+        fill.style.width = p + '%';
+        bar.appendChild(fill);
+        card.append(line, bar);
+      }
+      (e.fields || []).slice(0, 14).forEach((f) => {
+        const row = document.createElement('div');
+        row.className = 'crow';
+        const k = document.createElement('span');
+        k.textContent = usageKey(f.path);
+        k.title = f.path;
+        const v = document.createElement('b');
+        v.textContent = usageValue(f.path, f.value);
+        row.append(k, v);
+        card.appendChild(row);
+      });
+      creditsBox.appendChild(card);
+    });
+    if (usageNote) {
+      const n = document.createElement('div');
+      n.className = 'cnote';
+      n.textContent = usageNote;
+      creditsBox.appendChild(n);
+    }
+  }
+
   function limitsOf(id) {
     const info = state.spaceInfo[id];
     const m = modelById(id);
@@ -602,7 +706,11 @@
     state.limitsOpen = !state.limitsOpen;
     limBtn.setAttribute('aria-expanded', String(state.limitsOpen));
     limBox.classList.toggle('hidden', !state.limitsOpen);
-    if (state.limitsOpen) window.postMessage({ type: 'NOTION_EFFORT_SPACE_MODELS_REQUEST' }, '*');
+    if (state.limitsOpen) {
+      window.postMessage({ type: 'NOTION_EFFORT_SPACE_MODELS_REQUEST' }, '*');
+      window.postMessage({ type: 'NOTION_EFFORT_USAGE_REQUEST' }, '*');
+      renderCredits();
+    }
     renderLimits();
   });
 
@@ -1704,6 +1812,11 @@
 
     if (e.data.type === 'NOTION_EFFORT_ONBOARDING') onOnboarding(e.data);
     if (e.data.type === 'NOTION_EFFORT_OLD_CHAT_CREATE') onOldChatCreate(e.data);
+    if (e.data.type === 'NOTION_EFFORT_USAGE' && Array.isArray(e.data.entries)) {
+      usageEntries = e.data.entries;
+      usageNote = e.data.note || null;
+      if (state.limitsOpen) renderCredits();
+    }
 
     if (e.data.type === 'NOTION_EFFORT_OLD_CHAT' && typeof e.data.href === 'string' && isNotionUrl(e.data.href)) {
       if (state.oldChatUrl !== e.data.href) {
