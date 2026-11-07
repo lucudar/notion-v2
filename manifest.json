@@ -1,0 +1,61 @@
+{
+  "manifest_version": 3,
+  "name": "Notion AI Effort Control",
+  "version": "2.70",
+  "description": "Control AI model and reasoning effort in Notion + restore the model selector hidden on business trials",
+  "permissions": ["storage", "activeTab", "alarms", "scripting", "cookies"],
+  "host_permissions": [
+    "https://app.notion.com/*",
+    "https://www.notion.so/*",
+    "https://notion.so/*",
+    "http://127.0.0.1:8787/*",
+    "http://localhost:8787/*"
+  ],
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js", "unlock.js", "icons/*"],
+      "matches": [
+        "https://app.notion.com/*",
+        "https://www.notion.so/*",
+        "https://notion.so/*"
+      ]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.notion.com/*",
+        "https://www.notion.so/*",
+        "https://notion.so/*"
+      ],
+      "js": ["unlock.js", "inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://app.notion.com/*",
+        "https://www.notion.so/*",
+        "https://notion.so/*"
+      ],
+      "js": ["content.js", "models.js", "composer.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
