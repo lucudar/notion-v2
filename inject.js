@@ -1554,7 +1554,11 @@ let settings = {
     return numeric.some((f) => LIMIT_NUM.test(f.path));
   }
 
-  function noteLimits(path, p) {
+  // Notion's own usage requests (path -> body), so the panel can re-ask them.
+  const usageRequests = {};
+  const USAGE_URL = /credit|usage|quota|allowance|billing|entitlement|limit/i;
+
+  function noteLimits(path, p, opts) {
     if (LIMIT_SKIP.test(path)) return;
     p.then((res) => {
       if (!res || !res.ok) return;
@@ -1563,17 +1567,83 @@ let settings = {
       res.clone().text().then((text) => {
         let json;
         try { json = JSON.parse(text); } catch (e) { return; }
-        const out = [];
-        scanLimits(json, '', out, 0);
-        const fields = out.filter((f) => LIMIT_VALUE.test(f.path));
-        if (!fields.length) return;
-        const entry = { at: new Date().toISOString(), url: path, usage: looksLikeUsage(fields), fields: fields.slice(0, 60) };
-        const had = limitLog.some((l) => l.url === path);
-        if (had && !entry.usage) return;
-        logPush(limitLog, entry);
-        console.log('[Notion Effort] usage/limit response:', path, entry.usage ? '(usage-like)' : '(policy only)');
+        const entry = noteLimitsJson(path, json);
+        if (entry && (entry.usage || USAGE_URL.test(path)) && opts && typeof opts.body === 'string' && opts.body.length < 20000) {
+          let spaceId = null;
+          try { spaceId = new Headers(opts.headers || {}).get('x-notion-space-id'); } catch (e) {}
+          usageRequests[path] = { path: path, body: opts.body, spaceId: spaceId || currentSpaceId() };
+        }
       }).catch(() => {});
     }, () => {});
+  }
+
+  function noteLimitsJson(path, json) {
+    const out = [];
+    scanLimits(json, '', out, 0);
+    const fields = out.filter((f) => LIMIT_VALUE.test(f.path));
+    if (!fields.length) return null;
+    const entry = { at: new Date().toISOString(), url: path, usage: looksLikeUsage(fields), fields: fields.slice(0, 60) };
+    const had = limitLog.some((l) => l.url === path);
+    if (had && !entry.usage && !USAGE_URL.test(path)) return entry;
+    logPush(limitLog, entry);
+    console.log('[Notion Effort] usage/limit response:', path, entry.usage ? '(usage-like)' : '(policy only)');
+    if (entry.usage || USAGE_URL.test(path)) publishUsage();
+    return entry;
+  }
+
+  // The newest usage answer per request, for the Credits block in Limits.
+  function publishUsage(note) {
+    const latest = {};
+    limitLog.forEach((l) => { if (l.usage || USAGE_URL.test(l.url)) latest[l.url] = l; });
+    window.postMessage({
+      type: 'NOTION_EFFORT_USAGE',
+      entries: Object.keys(latest).map((k) => latest[k]),
+      note: note || null,
+    }, '*');
+  }
+
+  // Limits opened: re-ask Notion's own usage requests. None seen yet: try the
+  // credit / rate-limit status endpoint Notion's client calls.
+  let refreshingUsage = false;
+  async function refreshUsage() {
+    if (refreshingUsage) return;
+    refreshingUsage = true;
+    let note = null;
+    try {
+      const known = Object.keys(usageRequests).map((k) => usageRequests[k]);
+      if (known.length) {
+        for (let i = 0; i < known.length; i++) {
+          const r = known[i];
+          try {
+            noteLimitsJson(r.path, await apiPost('usage', r.spaceId || currentSpaceId(), r.path, JSON.parse(r.body)));
+          } catch (e) {
+            note = 'Could not refresh ' + shortUrl(r.path) + ': ' + String((e && e.message) || e).slice(0, 100);
+          }
+        }
+      } else {
+        const sid = currentSpaceId();
+        if (!sid) {
+          note = 'Workspace not known yet: open a page or send an AI message, then open Limits again.';
+        } else {
+          const path = '/api/v3/getCreditRateLimitStatus';
+          const bodies = [{ spaceId: dashedId(sid) }, {}];
+          for (let i = 0; i < bodies.length; i++) {
+            try {
+              const json = await apiPost('usage', sid, path, bodies[i]);
+              const e = noteLimitsJson(path, json);
+              usageRequests[path] = { path: path, body: JSON.stringify(bodies[i]), spaceId: sid };
+              note = e ? null : 'Notion answered ' + path + ' without usage figures.';
+              break;
+            } catch (e) {
+              note = 'Notion has not sent usage figures in this tab yet (' + String((e && e.message) || e).slice(0, 80) + '). Open Settings → Notion AI or send an AI message, then open Limits again.';
+            }
+          }
+        }
+      }
+    } finally {
+      refreshingUsage = false;
+    }
+    publishUsage(note);
   }
 
   function noteModelSetting(path, bodyText, p, via) {
@@ -2052,6 +2122,7 @@ let settings = {
     if (e.data.type === 'NOTION_EFFORT_RUNS_REQUEST') publishRuns();
     if (e.data.type === 'NOTION_EFFORT_FIND_ONBOARDING') findOnboarding();
     if (e.data.type === 'NOTION_EFFORT_CREATE_OLD_CHAT') createOldChat(e.data.text);
+    if (e.data.type === 'NOTION_EFFORT_USAGE_REQUEST') refreshUsage();
     if (e.data.type === 'NOTION_EFFORT_OLD_CHAT_DEAD') {
       trace('old chat', 'opened ' + String(e.data.id || '').slice(0, 8) + ' (saved as ' + (e.data.recordType || '?') + ') → Notion: no access at ' + shortUrl(e.data.url));
     }
@@ -2853,7 +2924,7 @@ let settings = {
       const self = this;
       const p = watch(effortFetch.apply(self, args));
       noteModelSetting(path.replace(location.origin, ''), opts.body, p);
-      noteLimits(path.replace(location.origin, ''), p);
+      noteLimits(path.replace(location.origin, ''), p, opts);
       return p;
     }
     // Before the message goes out: the policy (Auto picks the model for this
