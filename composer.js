@@ -282,6 +282,18 @@
       .model .mmeta { margin-top: 2px; font-size: 11px; color: #8b8b87; }
       .model .mmeta b { color: #e9e9e7; font-weight: 600; }
       .model .mmeta .warn { color: #d6a74a; }
+      .pill .chk {
+        font-size: 11px; font-weight: 700; line-height: 1;
+        padding: 2px 4px; border-radius: 4px; background: rgba(255,255,255,0.12); color: #e9e9e7;
+      }
+      .pill .chk.ok { background: #2f7d57; color: #fff; }
+      .pill .chk.warn { background: #d6a74a; color: #1d1d1d; }
+      .pill .chk.err { background: #eb645f; color: #fff; }
+      .model .mcheck { margin-top: 6px; padding: 5px 7px; border-radius: 6px; font-size: 12px; font-weight: 600;
+        background: rgba(255,255,255,0.06); color: #c8c8c4; }
+      .model .mcheck.ok { background: rgba(76,183,130,0.16); color: #7fc99a; }
+      .model .mcheck.warn { background: rgba(214,167,74,0.16); color: #e3bd6f; }
+      .model .mcheck.err { background: rgba(235,100,95,0.18); color: #f19a96; }
       .foot {
         flex: none;
         border-top: 1px solid rgba(255,255,255,0.08);
@@ -362,6 +374,7 @@
 
     <button class="pill" type="button" part="pill">
       <span class="dot"></span>
+      <span class="chk hidden"></span>
       <span class="pwant hidden"></span>
       <span class="pname">Effort</span>
       <span class="eff">Auto</span>
@@ -373,6 +386,7 @@
         <div class="lbl">Model in this chat (from Notion server)</div>
         <div class="mname">Send a message to see the model</div>
         <div class="mmeta"></div>
+        <div class="mcheck hidden"></div>
       </div>
       <div class="head">Reasoning effort</div>
       <div class="seg"></div>
@@ -421,6 +435,8 @@
   const modelLbl = shadow.querySelector('.model .lbl');
   const modelName = shadow.querySelector('.mname');
   const modelMeta = shadow.querySelector('.mmeta');
+  const pillChk = shadow.querySelector('.pill .chk');
+  const mCheck = shadow.querySelector('.mcheck');
   const menu = shadow.querySelector('.menu');
   const seg = shadow.querySelector('.seg');
   const effNote = shadow.querySelector('.effnote');
@@ -995,7 +1011,11 @@
     }
     const want = state.model;
     const wantEff = sentEffort(state.effort, modelById(want || ag.model)) || null;
-    if (!want && !wantEff) return { level: null, text: "Notion's choice: " + nameOf(ag.model) + ' · ' + E(ag.reasoningEffort) };
+    if (!want && !wantEff) {
+      const mc = modelCheck();
+      if (mc && mc.level) return { level: mc.level, text: mc.text + ' · ' + E(ag.reasoningEffort) };
+      return { level: null, text: "Notion's choice: " + nameOf(ag.model) + ' · ' + E(ag.reasoningEffort) };
+    }
     const limited = !!state.effort && !!wantEff && wantEff !== state.effort
       ? ' (' + E(state.effort) + ' not supported, ' + E(wantEff) + ' used)' : '';
     const blocked = ag.sticky && ag.sticky.model && want && ag.sticky.model !== want ? ag.sticky.model : null;
@@ -1024,6 +1044,94 @@
     return { level: limited ? 'warn' : 'ok', text: nameOf(run.ran) + ' · ' + E(run.effort || wantEff) + (limited || ' ✓') };
   }
 
+  // ---------------------------------------------- is it the right model?
+  //
+  // After every answer: the model that really answered (agent chat: the chat
+  // record 4 s / 15 s after the send; classic chat: the model named in the
+  // answer stream) against the model that was picked for that send: the
+  // panel's pick, or else the label on Notion's own model menu at send time.
+  // Auto everywhere = nothing to compare, the answer is just reported.
+  const menuAtSend = {}; // run key -> Notion menu label when that send went out
+  function runKey(r) {
+    return r.thread + '|' + r.at;
+  }
+  function noteMenuForRuns() {
+    let now;
+    runs.forEach((r) => {
+      const k = runKey(r);
+      if (k in menuAtSend) return;
+      if (now === undefined) now = readMenuModel();
+      menuAtSend[k] = now;
+    });
+  }
+  function idForLabel(label) {
+    const m = MODELS.find((x) => normName(x.name) === normName(label));
+    return m ? m.model : null;
+  }
+  function wantFromMenu(label) {
+    if (!label || AUTO_LABEL.test(label)) return null;
+    return { id: idForLabel(label), label: label, from: 'Notion menu' };
+  }
+  /** true / false, or null when the names cannot be matched either way. */
+  function sameModel(want, ranId) {
+    if (want.id) return want.id === ranId;
+    const m = modelById(ranId);
+    if (!m) return normName(ranId) === normName(want.label) ? true : null;
+    return normName(m.name) === normName(want.label);
+  }
+  function modelCheck() {
+    const run = state.agent && state.agent.thread ? lastRunFor(state.agent.thread) : null;
+    const la = state.lastApplied;
+    const runAt = run ? Date.parse(run.at) || 0 : 0;
+    const laAt = la && la.at ? la.at : 0;
+    let want = null;
+    let ranId = null;
+    if (run && runAt >= laAt) {
+      want = run.picked
+        ? { id: run.picked, label: nameOf(run.picked), from: 'the panel' }
+        : wantFromMenu(menuAtSend[runKey(run)]);
+      if (!run.ran) {
+        return { level: null, text: 'Checking which model answers' + (want ? ' (picked ' + want.label + ')' : '') + '…', ranId: null };
+      }
+      ranId = run.ran;
+    } else if (la) {
+      if (la.status === 'error') return null;
+      want = state.model
+        ? { id: state.model, label: nameOf(state.model), from: 'the panel' }
+        : wantFromMenu(la.menu);
+      ranId = la.actual || null;
+      if (!ranId) {
+        return want
+          ? { level: null, text: 'Picked ' + want.label + ' · the answer did not name its model, cannot check', ranId: null }
+          : null;
+      }
+    } else {
+      return null;
+    }
+    const ran = nameOf(ranId);
+    if (!want) return { level: null, text: 'Auto: ' + ran + ' answered', ranId: ranId };
+    const same = sameModel(want, ranId);
+    if (same === true) return { level: 'ok', text: '✓ Right model: ' + ran + ' answered', ranId: ranId };
+    if (same === false) {
+      return { level: 'err', text: '✗ Wrong model: ' + ran + ' answered, ' + want.label + ' was picked in ' + want.from, ranId: ranId };
+    }
+    return { level: 'warn', text: '? ' + ran + ' (' + ranId + ') answered, ' + want.label + ' was picked: names do not match up', ranId: ranId };
+  }
+  let lastCheckText = '';
+  function renderCheck() {
+    const mc = modelCheck();
+    const show = !!(mc && mc.ranId);
+    pillChk.classList.toggle('hidden', !show);
+    pillChk.textContent = !show ? '' : mc.level === 'ok' ? '✓' : mc.level === 'err' ? '✗' : mc.level === 'warn' ? '?' : '·';
+    paint(pillChk, show ? mc.level : null);
+    mCheck.classList.toggle('hidden', !mc);
+    mCheck.textContent = mc ? mc.text : '';
+    paint(mCheck, mc ? mc.level : null);
+    if (mc && mc.level && mc.text !== lastCheckText) console.log('[Notion Effort] ' + mc.text);
+    lastCheckText = mc ? mc.text : '';
+    return mc;
+  }
+
   function wroteThisThreadId(ap, ag) {
     return !!(ap && ap.detail && ag && String(ap.detail.thread || '').replace(/-/g, '') === String(ag.thread || '').replace(/-/g, ''));
   }
@@ -1037,7 +1145,8 @@
   function renderPill() {
     const ag = state.agent;
     const m = ag && ag.model ? modelById(ag.model) : null;
-    pillName.textContent = m ? m.name : ag && ag.model ? ag.model : 'Effort';
+    const mc = renderCheck();
+    pillName.textContent = m ? m.name : ag && ag.model ? ag.model : mc && mc.ranId ? nameOf(mc.ranId) : 'Effort';
     pillEff.textContent = state.effort ? EFFORT_LABELS[state.effort] : 'Auto';
     pillEff.classList.toggle('on', !!state.effort);
 
@@ -1055,9 +1164,16 @@
     pillReal.textContent = sw.effort ? E(ag.reasoningEffort) : '';
     paint(pillReal, sw.effort && cs ? cs.level : null);
     if (cs) {
-      paint(pill, cs.level);
-      paint(pillDot, cs.level);
-      pill.title = cs.text || '';
+      const level = mc && mc.level === 'err' ? 'err' : cs.level;
+      paint(pill, level);
+      paint(pillDot, level);
+      pill.title = (mc ? mc.text + '\n' : '') + (cs.text || '');
+      return;
+    }
+    pill.title = mc ? mc.text : '';
+    if (mc && mc.level) {
+      paint(pill, mc.level);
+      paint(pillDot, mc.level);
       return;
     }
     const v = currentVerdict();
@@ -1501,6 +1617,7 @@
     }
     if (e.data.type === 'NOTION_EFFORT_RUNS' && Array.isArray(e.data.runs)) {
       runs = e.data.runs.slice();
+      noteMenuForRuns();
       watchOnly = !!e.data.watchOnly;
       renderRuns();
       renderPill();
@@ -1582,7 +1699,11 @@
       // effort on Auto there is no 'pending' report to read it at.
       state.menuModel = readMenuModel() || state.menuModel;
       if (e.data.modelState === 'unknown') learnFromMenu(e.data.model, state.menuModel);
+      const prevApplied = state.lastApplied;
+      const sameSend = !!prevApplied && prevApplied.status === 'pending' && e.data.status !== 'pending';
       state.lastApplied = {
+        at: sameSend ? prevApplied.at : Date.now(),
+        menu: sameSend ? prevApplied.menu : state.menuModel,
         model: e.data.model,
         actual: e.data.actual || null,
         effort: e.data.effort,
