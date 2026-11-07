@@ -363,6 +363,14 @@ let settings = {
     return String(url || '').replace(/^https?:\/\/[^/]+/, '').split('?')[0];
   }
 
+  // The classic chat is the one that still sends runInferenceTranscript (model
+  // and effort live in its body). Tell the panel which page that was, so its
+  // "Open old AI chat" button can return there. Top frame only.
+  function noteOldChat(url) {
+    if (window.top !== window || !/runInferenceTranscript/i.test(String(url || ''))) return;
+    window.postMessage({ type: 'NOTION_EFFORT_OLD_CHAT', href: location.href }, '*');
+  }
+
   function noteSeen(url, via, reason) {
     const entry = {
       url: shortUrl(url),
@@ -576,6 +584,7 @@ let settings = {
       text = await readBody(input, options);
     } catch (e) {}
 
+    noteOldChat(url);
     const aiUrl = AI_URL.test(url);
     if (!text || text.length > 8000000 || !(aiUrl || AI_BODY.test(text))) {
       if (aiUrl) noteSeen(url, 'fetch', text ? 'body too large' : 'body not readable (not a string)');
@@ -643,6 +652,7 @@ let settings = {
   XMLHttpRequest.prototype.send = function (data) {
     try {
       const url = this.__effortUrl || '';
+      if (this.__effortMethod === 'POST') noteOldChat(url);
       if (
         this.__effortMethod === 'POST' &&
         url.indexOf('/api/') !== -1 &&
