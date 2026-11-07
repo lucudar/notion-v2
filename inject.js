@@ -2615,22 +2615,22 @@ let settings = {
       if (!spaceId && who) spaceId = who.spaceId;
       if (!spaceId) throw new Error('workspace not known yet, open any Notion page in this tab and try again');
       spaceId = dashedId(spaceId);
-      const path = (tpl && tpl.path) || '/api/v3/runInferenceTranscript';
-      // A saved classic request is sent as is; the default body tries the
-      // classic chat type, then the older workflow one.
-      const kinds = tpl ? [null] : ['markdown-chat', 'workflow'];
+      // The saved classic request goes first, as is; then the default body
+      // with the classic chat type, then the older workflow one.
+      const kinds = tpl ? [null, 'markdown-chat', 'workflow'] : ['markdown-chat', 'workflow'];
       let lastErr = null;
       for (let k = 0; k < kinds.length; k++) {
         const kind = kinds[k];
         const threadId = crypto.randomUUID();
-        const body = buildOldChatBody(tpl, kind, spaceId, threadId, text, who);
+        const body = buildOldChatBody(kind ? null : tpl, kind, spaceId, threadId, text, who);
         const h = headersFor(spaceId);
         h.set('accept', 'application/x-ndjson');
         h.set('notion-audit-log-platform', 'web');
         if (who && who.userId) h.set('x-notion-active-user-header', who.userId);
         trace('old chat', 'create ' + plainId(threadId).slice(0, 8) + ' via ' +
-          (tpl ? 'saved classic request (' + String(tpl.savedAt || '').slice(0, 16) + ')' : 'default body, type ' + kind) +
+          (!kind ? 'saved classic request (' + String(tpl.savedAt || '').slice(0, 16) + ')' : 'default body, type ' + kind) +
           ' · model ' + modelLabel(settings.model) + ' · effort ' + (settings.effort || 'Auto'));
+        const path = (!kind && tpl.path) || '/api/v3/runInferenceTranscript';
         const res = await effortFetch(location.origin + path, {
           method: 'POST', credentials: 'include', headers: h, body: JSON.stringify(body),
         });
