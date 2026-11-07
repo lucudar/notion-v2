@@ -368,8 +368,9 @@ let settings = {
   // "New old AI chat" button can return there. sure = the body carried a
   // transcript config we could patch, whatever the endpoint is called (the
   // agent chat never does). Top frame only.
+  let creatingOldChat = false; // true while createOldChat's own request is out
   function noteOldChat(url, sure) {
-    if (window.top !== window) return;
+    if (window.top !== window || creatingOldChat) return;
     if (!sure && !/runInferenceTranscript/i.test(String(url || ''))) return;
     window.postMessage({ type: 'NOTION_EFFORT_OLD_CHAT', href: location.href }, '*');
   }
@@ -612,6 +613,7 @@ let settings = {
     }
     noteSeen(url, 'fetch', result.modified ? 'patched' : 'already matched');
     noteOldChat(url, true);
+    rememberOldChatTemplate(url, body);
 
     if (!result.modified) {
       // No swap (Auto, or the body already matched). Still read the answer so
@@ -667,7 +669,10 @@ let settings = {
         interceptedCount++;
         const body = JSON.parse(data);
         const result = patchPayload(body);
-        if (result) noteOldChat(url, true);
+        if (result) {
+          noteOldChat(url, true);
+          rememberOldChatTemplate(url, body);
+        }
         noteSeen(
           url,
           'xhr',
@@ -2046,6 +2051,7 @@ let settings = {
     if (e.source !== window || !e.data) return;
     if (e.data.type === 'NOTION_EFFORT_RUNS_REQUEST') publishRuns();
     if (e.data.type === 'NOTION_EFFORT_FIND_ONBOARDING') findOnboarding();
+    if (e.data.type === 'NOTION_EFFORT_CREATE_OLD_CHAT') createOldChat(e.data.text);
     if (e.data.type === 'NOTION_EFFORT_WATCH_ONLY') {
       watchOnly = !!e.data.on;
       try { localStorage.setItem(WATCH_KEY, watchOnly ? '1' : '0'); } catch (x) {}
@@ -2396,6 +2402,266 @@ let settings = {
       .then((json) => { noteChatList(json, lastThreadList.path); scanForOnboarding(json, true); })
       .catch((e) => console.warn('[Notion Effort] chat list re-read failed:', e && e.message))
       .then(() => publishOnboarding('not-in-list'));
+  }
+
+
+  // ---- Create a classic chat ------------------------------------------------
+  //
+  // "Create old AI chat" makes a new classic chat itself: one
+  // runInferenceTranscript with a fresh threadId and createThread: true. The
+  // body comes from the last classic request seen in this browser (its config
+  // and context steps only, no message text), or from a default body when none
+  // was seen yet. The first message is the one typed in the panel. Effort (and
+  // the picked model) go in through the usual patch. The answer stream is read
+  // to the end so the server finishes the thread; then the panel opens it.
+  const OLD_TEMPLATE_KEY = 'notionEffortOldChatTemplate';
+  const OLD_CREATE_TIMEOUT = 120000;
+
+  function cloneJson(v) {
+    return JSON.parse(JSON.stringify(v));
+  }
+
+  function rememberOldChatTemplate(url, body) {
+    try {
+      if (creatingOldChat || window.top !== window) return;
+      if (!/runInferenceTranscript/i.test(String(url || ''))) return;
+      if (!body || !Array.isArray(body.transcript)) return;
+      const isStep = (t) => (s) => s && s.type === t && s.value && typeof s.value === 'object';
+      const config = body.transcript.find(isStep('config'));
+      if (!config) return;
+      const context = body.transcript.find(isStep('context')) || null;
+      const top = {};
+      Object.keys(body).forEach((k) => { if (k !== 'transcript') top[k] = body[k]; });
+      localStorage.setItem(OLD_TEMPLATE_KEY, JSON.stringify({
+        path: shortUrl(url) || '/api/v3/runInferenceTranscript',
+        savedAt: new Date().toISOString(),
+        spaceId: body.spaceId || currentSpaceId() || null,
+        top: cloneJson(top),
+        config: cloneJson(config),
+        context: context ? cloneJson(context) : null,
+      }));
+    } catch (e) {}
+  }
+
+  function loadOldChatTemplate() {
+    try {
+      const t = JSON.parse(localStorage.getItem(OLD_TEMPLATE_KEY) || 'null');
+      return t && t.config && t.config.value && t.top ? t : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  window.__notionEffortOldChatTemplate = loadOldChatTemplate;
+
+  // Who is signed in and the ids/names Notion puts into the context step.
+  async function oldChatSession(spaceId) {
+    const res = await effortFetch(location.origin + '/api/v3/getSpaces', {
+      method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    const json = await res.json();
+    let pick = null;
+    Object.keys(json || {}).forEach((uid) => {
+      const acc = json[uid] || {};
+      const has = !!spaceId && Object.keys(acc.space || {}).some((k) => plainId(k) === plainId(spaceId));
+      if (!pick || (has && !pick.has)) pick = { uid: uid, acc: acc, has: has };
+    });
+    if (!pick) return null;
+    const acc = pick.acc;
+    const sid = spaceId || Object.keys(acc.space || {})[0] || null;
+    const spaceKey = Object.keys(acc.space || {}).find((k) => plainId(k) === plainId(sid));
+    const user = unwrapRecord((acc.notion_user || {})[pick.uid]) || {};
+    const space = (spaceKey && unwrapRecord(acc.space[spaceKey])) || {};
+    let spaceViewId = null;
+    Object.keys(acc.space_view || {}).forEach((k) => {
+      const v = unwrapRecord(acc.space_view[k]);
+      if (v && v.space_id && plainId(v.space_id) === plainId(sid)) spaceViewId = v.id || k;
+    });
+    return {
+      userId: pick.uid,
+      spaceId: sid,
+      userName: user.name || null,
+      userEmail: user.email || null,
+      spaceName: space.name || null,
+      spaceViewId: spaceViewId,
+    };
+  }
+
+  function buildOldChatBody(tpl, kind, spaceId, threadId, text, who) {
+    const now = new Date().toISOString();
+    const uid = who && who.userId;
+    const sameSpace = !!tpl && plainId(tpl.spaceId) === plainId(spaceId);
+
+    const config = tpl ? cloneJson(tpl.config) : {
+      type: 'config',
+      value: {
+        type: kind,
+        useWebSearch: true,
+        useReadOnlyMode: false,
+        writerMode: false,
+        isCustomAgent: false,
+        enableCreateAndRunThread: true,
+      },
+    };
+    config.id = crypto.randomUUID();
+    if (settings.model) {
+      config.value.model = settings.model;
+      if (!tpl || 'modelFromUser' in config.value) config.value.modelFromUser = true;
+    }
+
+    const context = tpl && tpl.context ? cloneJson(tpl.context) : { type: 'context', value: {} };
+    context.id = crypto.randomUUID();
+    const cv = context.value;
+    if (!sameSpace) {
+      cv.spaceId = spaceId;
+      if (uid) cv.userId = uid;
+      if (who && who.userName) cv.userName = who.userName;
+      if (who && who.userEmail && (!tpl || 'userEmail' in cv)) cv.userEmail = who.userEmail;
+      if (who && who.spaceName) cv.spaceName = who.spaceName;
+      if (who && who.spaceViewId) cv.spaceViewId = who.spaceViewId;
+    }
+    if (!tpl || 'currentDatetime' in cv) cv.currentDatetime = now;
+    if (!cv.timezone) {
+      try { cv.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+    }
+    if (!tpl) cv.surface = 'ai_module';
+
+    const user = { id: crypto.randomUUID(), type: 'user', value: [[text]], createdAt: now };
+    if (uid) user.userId = uid;
+
+    const body = tpl ? cloneJson(tpl.top) : {
+      threadParentPointer: { table: 'space', id: spaceId, spaceId: spaceId },
+      generateTitle: true,
+      saveAllThreadOperations: true,
+      setUnreadState: true,
+      isPartialTranscript: true,
+      asPatchResponse: true,
+      threadType: kind,
+    };
+    body.traceId = crypto.randomUUID();
+    body.spaceId = spaceId;
+    body.threadId = threadId;
+    body.createThread = true;
+    if (!tpl || 'generateTitle' in body) body.generateTitle = true;
+    const ptr = body.threadParentPointer;
+    if (ptr && typeof ptr === 'object' && !sameSpace) {
+      if (ptr.table === 'space') ptr.id = spaceId;
+      if ('spaceId' in ptr) ptr.spaceId = spaceId;
+    }
+    body.transcript = [config, context, user];
+    return body;
+  }
+
+  /** Short error text from one ndjson line of the answer (never answer text). */
+  function oldStreamError(line) {
+    try {
+      const o = JSON.parse(line);
+      if (!o || typeof o !== 'object' || (o.type !== 'error' && !o.error)) return null;
+      const m = o.message || (o.error && (o.error.message || o.error.name || o.error)) || o.type;
+      return String(typeof m === 'string' ? m : JSON.stringify(m)).slice(0, 200);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function drainOldChatStream(res) {
+    const out = { lines: 0, error: null, timedOut: false };
+    if (!res.body || !res.body.getReader) {
+      await res.text().catch(() => '');
+      return out;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const until = Date.now() + OLD_CREATE_TIMEOUT;
+    let buf = '';
+    const take = (line) => {
+      line = line.trim();
+      if (!line) return;
+      out.lines++;
+      if (!out.error) out.error = oldStreamError(line);
+    };
+    for (;;) {
+      const left = until - Date.now();
+      const step = left > 0
+        ? await Promise.race([reader.read(), new Promise((r) => setTimeout(() => r(null), left))])
+        : null;
+      if (!step) {
+        out.timedOut = true;
+        reader.cancel().catch(() => {});
+        break;
+      }
+      if (step.done) break;
+      buf += decoder.decode(step.value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) !== -1) {
+        take(buf.slice(0, i));
+        buf = buf.slice(i + 1);
+      }
+    }
+    take(buf);
+    return out;
+  }
+
+  async function createOldChat(text) {
+    const report = (o) => window.postMessage(Object.assign({ type: 'NOTION_EFFORT_OLD_CHAT_CREATE' }, o), '*');
+    if (window.top !== window) return;
+    if (creatingOldChat) { report({ status: 'busy' }); return; }
+    creatingOldChat = true;
+    const tpl = loadOldChatTemplate();
+    try {
+      text = String(text || '').trim() || 'Hi';
+      report({ status: 'sending' });
+      let spaceId = currentSpaceId() || (tpl && tpl.spaceId) || null;
+      const who = await oldChatSession(spaceId).catch(() => null);
+      if (!spaceId && who) spaceId = who.spaceId;
+      if (!spaceId) throw new Error('workspace not known yet, open any Notion page in this tab and try again');
+      spaceId = dashedId(spaceId);
+      const path = (tpl && tpl.path) || '/api/v3/runInferenceTranscript';
+      // A saved classic request is sent as is; the default body tries the
+      // classic chat type, then the older workflow one.
+      const kinds = tpl ? [null] : ['markdown-chat', 'workflow'];
+      let lastErr = null;
+      for (let k = 0; k < kinds.length; k++) {
+        const kind = kinds[k];
+        const threadId = crypto.randomUUID();
+        const body = buildOldChatBody(tpl, kind, spaceId, threadId, text, who);
+        const h = headersFor(spaceId);
+        h.set('accept', 'application/x-ndjson');
+        h.set('notion-audit-log-platform', 'web');
+        if (who && who.userId) h.set('x-notion-active-user-header', who.userId);
+        trace('old chat', 'create ' + plainId(threadId).slice(0, 8) + ' via ' +
+          (tpl ? 'saved classic request (' + String(tpl.savedAt || '').slice(0, 16) + ')' : 'default body, type ' + kind) +
+          ' · model ' + modelLabel(settings.model) + ' · effort ' + (settings.effort || 'Auto'));
+        const res = await effortFetch(location.origin + path, {
+          method: 'POST', credentials: 'include', headers: h, body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const t = await res.text().catch(() => '');
+          lastErr = 'HTTP ' + res.status + ' ' + t.slice(0, 200);
+          trace('old chat', 'create FAILED: ' + lastErr);
+          continue;
+        }
+        report({ status: 'answering', id: plainId(threadId) });
+        const r = await drainOldChatStream(res);
+        if (r.error) {
+          lastErr = r.error;
+          trace('old chat', 'create FAILED in the answer: ' + r.error);
+          if (k < kinds.length - 1) continue;
+          report({ status: 'error', id: plainId(threadId), error: r.error, fromTemplate: !!tpl });
+          return;
+        }
+        trace('old chat', 'created ✓ ' + plainId(threadId).slice(0, 8) + ' (' + r.lines + ' stream lines' +
+          (r.timedOut ? ', answer still running after ' + OLD_CREATE_TIMEOUT / 1000 + ' s' : '') + ')');
+        report({ status: 'created', id: plainId(threadId), lines: r.lines, timedOut: r.timedOut, fromTemplate: !!tpl });
+        return;
+      }
+      report({ status: 'failed', error: lastErr, fromTemplate: !!tpl });
+    } catch (e) {
+      const msg = String((e && e.message) || e).slice(0, 200);
+      trace('old chat', 'create FAILED: ' + msg);
+      report({ status: 'failed', error: msg, fromTemplate: !!tpl });
+    } finally {
+      creatingOldChat = false;
+    }
   }
 
   const effortFetch = window.fetch;
